@@ -11,22 +11,56 @@ import UserNotifications
 
 @main
 struct BitchatApp: App {
-    @StateObject private var chatViewModel = ChatViewModel()
+    static let bundleID = Bundle.main.bundleIdentifier ?? "chat.bitchat"
+    static let groupID = "group.\(bundleID)"
+
+    @StateObject private var runtime: AppRuntime
+    @AppStorage(AppTheme.storageKey) private var appThemeRawValue = AppTheme.matrix.rawValue
     #if os(iOS)
+    @Environment(\.scenePhase) var scenePhase
     @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+    #elseif os(macOS)
+    @NSApplicationDelegateAdaptor(MacAppDelegate.self) var appDelegate
     #endif
-    
+
     init() {
+        _runtime = StateObject(wrappedValue: AppRuntime())
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
     }
-    
+
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(chatViewModel)
+                .environment(\.appTheme, AppTheme(rawValue: appThemeRawValue) ?? .matrix)
+                .environmentObject(runtime.publicChatModel)
+                .environmentObject(runtime.privateInboxModel)
+                .environmentObject(runtime.privateConversationModel)
+                .environmentObject(runtime.verificationModel)
+                .environmentObject(runtime.conversationUIModel)
+                .environmentObject(runtime.locationChannelsModel)
+                .environmentObject(runtime.peerListModel)
+                .environmentObject(runtime.appChromeModel)
+                .environmentObject(runtime.boardAlertsModel)
+                .environmentObject(runtime.sharedContentImportModel)
                 .onAppear {
-                    NotificationDelegate.shared.chatViewModel = chatViewModel
+                    appDelegate.runtime = runtime
+                    runtime.start()
                 }
+                .onOpenURL { url in
+                    runtime.handleOpenURL(url)
+                }
+                #if os(iOS)
+                .onChange(of: scenePhase) { newPhase in
+                    runtime.handleScenePhaseChange(newPhase)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                    runtime.handleDidBecomeActiveNotification()
+                }
+                #elseif os(macOS)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    runtime.handleMacDidBecomeActiveNotification()
+                }
+                #endif
         }
         #if os(macOS)
         .windowStyle(.hiddenTitleBar)
@@ -36,45 +70,70 @@ struct BitchatApp: App {
 }
 
 #if os(iOS)
-class AppDelegate: NSObject, UIApplicationDelegate {
-    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    weak var runtime: AppRuntime?
+
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Installed before the first resign-active so the app-switcher snapshot
+        // never captures an open conversation.
+        PrivacyScreen.shared.install()
         return true
+    }
+
+    func applicationWillTerminate(_ application: UIApplication) {
+        runtime?.applicationWillTerminate()
     }
 }
 #endif
 
-class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
-    static let shared = NotificationDelegate()
-    weak var chatViewModel: ChatViewModel?
-    
-    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
-        let identifier = response.notification.request.identifier
-        
-        // Check if this is a private message notification
-        if identifier.hasPrefix("private-") {
-            // Extract sender from notification title
-            let title = response.notification.request.content.title
-            if let senderName = title.replacingOccurrences(of: "Private message from ", with: "").nilIfEmpty {
-                // Find peer ID and open chat
-                if let peerID = chatViewModel?.getPeerIDForNickname(senderName) {
-                    DispatchQueue.main.async {
-                        self.chatViewModel?.startPrivateChat(with: peerID)
-                    }
-                }
-            }
-        }
-        
-        completionHandler()
+#if os(macOS)
+import AppKit
+
+final class MacAppDelegate: NSObject, NSApplicationDelegate {
+    weak var runtime: AppRuntime?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        runtime?.applicationWillTerminate()
     }
-    
-    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
-        // Show notification even when app is in foreground (for testing)
-        completionHandler([.banner, .sound])
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 }
+#endif
 
-extension String {
-    var nilIfEmpty: String? {
-        self.isEmpty ? nil : self
+final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotificationDelegate()
+    weak var runtime: AppRuntime?
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
+        let identifier = response.notification.request.identifier
+        let actionIdentifier = response.actionIdentifier
+        let userInfo = response.notification.request.content.userInfo
+
+        // Complete only after the response is handled: for a background
+        // action (👋 wave) the system may suspend the app the moment the
+        // completion handler runs, which would drop the queued send.
+        Task { @MainActor in
+            self.runtime?.handleNotificationResponse(
+                identifier: identifier,
+                actionIdentifier: actionIdentifier,
+                userInfo: userInfo
+            )
+            completionHandler()
+        }
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        let identifier = notification.request.identifier
+        let userInfo = notification.request.content.userInfo
+
+        Task {
+            let options = await self.runtime?.presentationOptions(
+                forNotificationIdentifier: identifier,
+                userInfo: userInfo
+            ) ?? [.banner, .sound]
+            completionHandler(options)
+        }
     }
 }

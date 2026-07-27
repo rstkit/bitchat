@@ -7,1156 +7,511 @@
 //
 
 import SwiftUI
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
+import BitFoundation
+
+struct ContentRootModalPresentationState {
+    var isPeopleSheetPresented = false
+    var isAppInfoPresented = false
+    var isFingerprintPresented = false
+    var isLocationChannelsSheetPresented = false
+    var isNoticesSheetPresented = false
+    var isImagePreviewPresented = false
+    var isVerificationSheetPresented = false
+    var isVoiceAlertPresented = false
+    var isScreenshotPrivacyAlertPresented = false
+    var isMediaPickerPresented = false
+
+    var hasPresentation: Bool {
+        isPeopleSheetPresented
+            || isAppInfoPresented
+            || isFingerprintPresented
+            || isLocationChannelsSheetPresented
+            || isNoticesSheetPresented
+            || isImagePreviewPresented
+            || isVerificationSheetPresented
+            || isVoiceAlertPresented
+            || isScreenshotPrivacyAlertPresented
+            || isMediaPickerPresented
+    }
+}
+
+extension ContentRootModalPresentationState {
+    @MainActor
+    init(
+        appChromeModel: AppChromeModel,
+        isPeopleSheetPresented: Bool = false,
+        isImagePreviewPresented: Bool = false,
+        isVerificationSheetPresented: Bool = false,
+        isVoiceAlertPresented: Bool = false,
+        isMediaPickerPresented: Bool = false
+    ) {
+        self.init(
+            isPeopleSheetPresented: isPeopleSheetPresented,
+            isAppInfoPresented: appChromeModel.isAppInfoPresented,
+            isFingerprintPresented:
+                appChromeModel.showingFingerprintFor != nil,
+            isLocationChannelsSheetPresented:
+                appChromeModel.isLocationChannelsSheetPresented,
+            isNoticesSheetPresented:
+                appChromeModel.isNoticesSheetPresented,
+            isImagePreviewPresented: isImagePreviewPresented,
+            isVerificationSheetPresented: isVerificationSheetPresented,
+            isVoiceAlertPresented: isVoiceAlertPresented,
+            isScreenshotPrivacyAlertPresented:
+                appChromeModel.showScreenshotPrivacyWarning,
+            isMediaPickerPresented: isMediaPickerPresented
+        )
+    }
+}
+
+/// On macOS 14+, disables the default system focus ring on TextFields.
+/// On earlier macOS versions and on iOS this is a no-op.
+struct FocusEffectDisabledModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if os(macOS)
+        if #available(macOS 14.0, *) {
+            content.focusEffectDisabled()
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
+    }
+}
 
 struct ContentView: View {
-    @EnvironmentObject var viewModel: ChatViewModel
+    @EnvironmentObject private var appChromeModel: AppChromeModel
+    @EnvironmentObject private var privateConversationModel: PrivateConversationModel
+    @EnvironmentObject private var verificationModel: VerificationModel
+    @EnvironmentObject private var conversationUIModel: ConversationUIModel
+    @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
+    @EnvironmentObject private var sharedContentImportModel: SharedContentImportModel
+
+    @StateObject private var voiceRecordingVM = VoiceRecordingViewModel()
     @State private var messageText = ""
-    @State private var textFieldSelection: NSRange? = nil
     @FocusState private var isTextFieldFocused: Bool
     @Environment(\.colorScheme) var colorScheme
-    @State private var showPeerList = false
+    @Environment(\.appTheme) private var appTheme
+    @Environment(\.scenePhase) private var scenePhase
     @State private var showSidebar = false
-    @State private var sidebarDragOffset: CGFloat = 0
-    @State private var showAppInfo = false
-    @State private var showPasswordInput = false
-    @State private var passwordInputRoom: String? = nil
-    @State private var passwordInput = ""
-    @State private var showPasswordPrompt = false
-    @State private var passwordPromptInput = ""
-    @State private var showPasswordError = false
-    @State private var showCommandSuggestions = false
-    @State private var commandSuggestions: [String] = []
-    
-    private var backgroundColor: Color {
-        colorScheme == .dark ? Color.black : Color.white
+    @State private var selectedMessageSender: String?
+    @State private var selectedMessageSenderID: PeerID?
+    @FocusState private var isNicknameFieldFocused: Bool
+    @State private var isAtBottomPublic = true
+    @State private var isAtBottomPrivate = true
+    @State private var autocompleteDebounceTimer: Timer?
+    @State private var showVerifySheet = false
+    @State private var imagePreviewURL: URL?
+    #if os(iOS)
+    @State private var showImagePicker = false
+    @State private var imagePickerSourceType: UIImagePickerController.SourceType = .camera
+    #else
+    @State private var showMacImagePicker = false
+    #endif
+    @ScaledMetric(relativeTo: .body) private var headerHeight: CGFloat = 44
+    @ScaledMetric(relativeTo: .subheadline) private var headerPeerIconSize: CGFloat = 11
+    @ScaledMetric(relativeTo: .subheadline) private var headerPeerCountFontSize: CGFloat = 12
+    @State private var windowCountPublic: Int = 300
+    @State private var windowCountPrivate: [PeerID: Int] = [:]
+
+    @ThemedPalette private var palette
+
+    private var selectedPrivatePeerID: PeerID? {
+        privateConversationModel.selectedPeerID
     }
-    
-    private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+
+    private var sharedContentDestination: SharedContentDestination {
+        SharedContentDestination.resolve(
+            selectedPrivatePeerID: selectedPrivatePeerID,
+            privateDisplayName: privateConversationModel.selectedHeaderState?.displayName,
+            activeChannel: locationChannelsModel.selectedChannel
+        )
     }
-    
-    private var secondaryTextColor: Color {
-        colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
+
+    private var usesGlassLayout: Bool { appTheme.usesGlassChrome }
+
+    private var isPeopleSheetPresented: Bool {
+        showSidebar || selectedPrivatePeerID != nil
     }
-    
+
+    private func rootModalPresentationState(
+        includingVoiceAlert: Bool
+    ) -> ContentRootModalPresentationState {
+        #if os(iOS)
+        let isMediaPickerPresented = showImagePicker
+        #else
+        let isMediaPickerPresented = showMacImagePicker
+        #endif
+
+        return ContentRootModalPresentationState(
+            appChromeModel: appChromeModel,
+            isPeopleSheetPresented: isPeopleSheetPresented,
+            isImagePreviewPresented: imagePreviewURL != nil,
+            isVerificationSheetPresented: showVerifySheet,
+            isVoiceAlertPresented: includingVoiceAlert && voiceRecordingVM.showAlert,
+            isMediaPickerPresented: isMediaPickerPresented
+        )
+    }
+
+    private var hasRootModalPresentation: Bool {
+        rootModalPresentationState(includingVoiceAlert: true).hasPresentation
+    }
+
+    /// The voice alert cannot defer to itself: its own binding must keep
+    /// reporting `true` while it is the presented modal.
+    private var hasRootModalPresentationBesidesVoiceAlert: Bool {
+        rootModalPresentationState(includingVoiceAlert: false).hasPresentation
+    }
+
+    private var rootBluetoothAlertBinding: Binding<Bool> {
+        Binding(
+            get: {
+                scenePhase == .active
+                    && appChromeModel.showBluetoothAlert
+                    && !hasRootModalPresentation
+            },
+            set: { isPresented in
+                guard !isPresented,
+                      scenePhase == .active,
+                      !hasRootModalPresentation else {
+                    return
+                }
+                appChromeModel.showBluetoothAlert = false
+            }
+        )
+    }
+
+    /// Voice recording errors can surface while the people/DM sheet is up
+    /// (recording happens inside the sheet). Presenting the root alert then
+    /// would force-dismiss the sheet, so the root copy defers to any other
+    /// root modal; the sheet presents its own copy. Mirrors the Bluetooth
+    /// alert treatment above.
+    private var rootVoiceAlertBinding: Binding<Bool> {
+        Binding(
+            get: {
+                scenePhase == .active
+                    && voiceRecordingVM.showAlert
+                    && !hasRootModalPresentationBesidesVoiceAlert
+            },
+            set: { isPresented in
+                guard !isPresented,
+                      scenePhase == .active,
+                      !hasRootModalPresentationBesidesVoiceAlert else {
+                    return
+                }
+                voiceRecordingVM.showAlert = false
+            }
+        )
+    }
+
     var body: some View {
-        ZStack {
-            // Main content
-            GeometryReader { geometry in
-                ZStack {
-                    VStack(spacing: 0) {
-                        headerView
-                        Divider()
-                        messagesView
-                        Divider()
-                        inputView
-                    }
-                    .background(backgroundColor)
-                    .foregroundColor(textColor)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { value in
-                                // Only respond to leftward swipes when sidebar is closed
-                                // or rightward swipes when sidebar is open
-                                if !showSidebar && value.translation.width < 0 {
-                                    sidebarDragOffset = max(value.translation.width, -geometry.size.width * 0.7)
-                                } else if showSidebar && value.translation.width > 0 {
-                                    sidebarDragOffset = min(-geometry.size.width * 0.7 + value.translation.width, 0)
-                                }
-                            }
-                            .onEnded { value in
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    if !showSidebar {
-                                        // Opening gesture (swipe left)
-                                        if value.translation.width < -100 || (value.translation.width < -50 && value.velocity.width < -500) {
-                                            showSidebar = true
-                                            sidebarDragOffset = 0
-                                        } else {
-                                            sidebarDragOffset = 0
-                                        }
-                                    } else {
-                                        // Closing gesture (swipe right)
-                                        if value.translation.width > 100 || (value.translation.width > 50 && value.velocity.width > 500) {
-                                            showSidebar = false
-                                            sidebarDragOffset = 0
-                                        } else {
-                                            sidebarDragOffset = 0
-                                        }
-                                    }
-                                }
-                            }
-                    )
-                    
-                    // Sidebar overlay
-                    HStack(spacing: 0) {
-                        // Tap to dismiss area
-                        Color.clear
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                    showSidebar = false
-                                    sidebarDragOffset = 0
-                                }
-                            }
-                        
-                        sidebarView
-                            #if os(macOS)
-                            .frame(width: min(300, geometry.size.width * 0.4))
-                            #else
-                            .frame(width: geometry.size.width * 0.7)
-                            #endif
-                            .transition(.move(edge: .trailing))
-                    }
-                    .offset(x: showSidebar ? -sidebarDragOffset : geometry.size.width - sidebarDragOffset)
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: showSidebar)
-                    .animation(.spring(response: 0.3, dampingFraction: 0.8), value: sidebarDragOffset)
+        mainContent
+            .onAppear {
+                conversationUIModel.setCurrentColorScheme(colorScheme)
+                conversationUIModel.setCurrentTheme(appTheme)
+                voiceRecordingVM.sessionProvider = { [weak conversationUIModel] in
+                    conversationUIModel?.makeVoiceCaptureSession() ?? VoiceNoteCaptureSession()
                 }
-            }
-            
-            // Autocomplete overlay
-            if viewModel.showAutocomplete && !viewModel.autocompleteSuggestions.isEmpty {
-                GeometryReader { geometry in
-                    VStack {
-                        Spacer()
-                        HStack {
-                            // Calculate approximate position based on nickname length and @ position
-                            let nicknameWidth: CGFloat = viewModel.selectedPrivateChatPeer != nil ? 90 : 80
-                            let charWidth: CGFloat = 8.5 // Approximate width of monospace character
-                            let atPosition = CGFloat(viewModel.autocompleteRange?.location ?? 0)
-                            let offsetX = nicknameWidth + (atPosition * charWidth)
-                            
-                            // Ensure offsetX is valid (not NaN or infinite)
-                            let safeOffsetX = offsetX.isFinite ? offsetX : nicknameWidth
-                            
-                            VStack(alignment: .leading, spacing: 0) {
-                                ForEach(Array(viewModel.autocompleteSuggestions.enumerated()), id: \.element) { index, suggestion in
-                                    Button(action: {
-                                        _ = viewModel.completeNickname(suggestion, in: &messageText)
-                                    }) {
-                                        HStack {
-                                            Text("@\(suggestion)")
-                                                .font(.system(size: 12, design: .monospaced))
-                                                .foregroundColor(index == viewModel.selectedAutocompleteIndex ? backgroundColor : textColor)
-                                            Spacer()
-                                        }
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(index == viewModel.selectedAutocompleteIndex ? textColor : Color.clear)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .background(backgroundColor)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(secondaryTextColor.opacity(0.5), lineWidth: 1)
-                            )
-                            .frame(width: 150, alignment: .leading)
-                            .offset(x: min(safeOffsetX, max(0, geometry.size.width - 180))) // Prevent going off-screen
-                            .padding(.bottom, 45) // Position just above input
-                            
-                            Spacer()
-                        }
-                        .padding(.horizontal, 12)
-                    }
+                appChromeModel.setPanicPreparation { [weak voiceRecordingVM] in
+                    voiceRecordingVM?.panicWipe()
                 }
+                #if os(macOS)
+                DispatchQueue.main.async {
+                    isNicknameFieldFocused = false
+                    isTextFieldFocused = true
+                }
+                #endif
+                sharedContentImportModel.updateDestination(sharedContentDestination)
             }
-        }
+            .onChange(of: colorScheme) { newValue in
+                conversationUIModel.setCurrentColorScheme(newValue)
+            }
+            .onChange(of: appTheme) { newValue in
+                conversationUIModel.setCurrentTheme(newValue)
+            }
+        .background(ThemedRootBackground())
+        .foregroundColor(palette.primary)
         #if os(macOS)
         .frame(minWidth: 600, minHeight: 400)
         #endif
-        .sheet(isPresented: $showAppInfo) {
-            AppInfoView()
-        }
-        .alert("Set Room Password", isPresented: $showPasswordInput) {
-            SecureField("Password", text: $passwordInput)
-            Button("Cancel", role: .cancel) {
-                passwordInput = ""
-                passwordInputRoom = nil
+        .onChange(of: selectedPrivatePeerID) { newValue in
+            if newValue != nil {
+                showSidebar = true
             }
-            Button("Set Password") {
-                if let room = passwordInputRoom, !passwordInput.isEmpty {
-                    viewModel.setRoomPassword(passwordInput, for: room)
-                    passwordInput = ""
-                    passwordInputRoom = nil
+            sharedContentImportModel.updateDestination(sharedContentDestination)
+        }
+        .onChange(of: locationChannelsModel.selectedChannel) { _ in
+            sharedContentImportModel.updateDestination(sharedContentDestination)
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { isPeopleSheetPresented },
+                set: { isPresented in
+                    if !isPresented {
+                        showSidebar = false
+                        // Scene/background and alert-presentation
+                        // reconciliation (Bluetooth-off, recording errors)
+                        // are not user requests to leave the conversation.
+                        // Keep the selected DM so the sheet remains live
+                        // when the app returns from Settings.
+                        if scenePhase == .active,
+                           !appChromeModel.showBluetoothAlert,
+                           !voiceRecordingVM.showAlert {
+                            privateConversationModel.endConversation()
+                        }
+                    }
                 }
-            }
-        } message: {
-            Text("Enter a password to protect \(passwordInputRoom ?? "room"). Others will need this password to read messages.")
+            )
+        ) {
+            #if os(iOS)
+            ContentPeopleSheetView(
+                showSidebar: $showSidebar,
+                messageText: $messageText,
+                selectedMessageSender: $selectedMessageSender,
+                selectedMessageSenderID: $selectedMessageSenderID,
+                imagePreviewURL: $imagePreviewURL,
+                windowCountPublic: $windowCountPublic,
+                windowCountPrivate: $windowCountPrivate,
+                isAtBottomPrivate: $isAtBottomPrivate,
+                isTextFieldFocused: $isTextFieldFocused,
+                voiceRecordingVM: voiceRecordingVM,
+                autocompleteDebounceTimer: $autocompleteDebounceTimer,
+                headerHeight: headerHeight,
+                onSendMessage: sendMessage,
+                showImagePicker: $showImagePicker,
+                imagePickerSourceType: $imagePickerSourceType
+            )
+            #else
+            ContentPeopleSheetView(
+                showSidebar: $showSidebar,
+                messageText: $messageText,
+                selectedMessageSender: $selectedMessageSender,
+                selectedMessageSenderID: $selectedMessageSenderID,
+                imagePreviewURL: $imagePreviewURL,
+                windowCountPublic: $windowCountPublic,
+                windowCountPrivate: $windowCountPrivate,
+                isAtBottomPrivate: $isAtBottomPrivate,
+                isTextFieldFocused: $isTextFieldFocused,
+                voiceRecordingVM: voiceRecordingVM,
+                autocompleteDebounceTimer: $autocompleteDebounceTimer,
+                headerHeight: headerHeight,
+                onSendMessage: sendMessage,
+                showMacImagePicker: $showMacImagePicker
+            )
+            #endif
         }
-        .alert("Enter Room Password", isPresented: Binding(
-            get: { viewModel.showPasswordPrompt },
-            set: { viewModel.showPasswordPrompt = $0 }
+        .sheet(isPresented: $appChromeModel.isAppInfoPresented) {
+            AppInfoView(
+                topologyProvider: { appChromeModel.meshTopologyDisplayModel() },
+                onPanicWipe: { appChromeModel.panicClearAllData() }
+            )
+            .environmentObject(locationChannelsModel)
+        }
+        .sheet(isPresented: Binding(
+            get: { appChromeModel.showingFingerprintFor != nil && !showSidebar && selectedPrivatePeerID == nil },
+            set: { _ in appChromeModel.clearFingerprint() }
         )) {
-            SecureField("Password", text: $passwordPromptInput)
-            Button("Cancel", role: .cancel) {
-                passwordPromptInput = ""
-                viewModel.passwordPromptRoom = nil
+            if let peerID = appChromeModel.showingFingerprintFor {
+                FingerprintView(peerID: peerID)
+                    .environmentObject(verificationModel)
             }
-            Button("Join") {
-                if let room = viewModel.passwordPromptRoom, !passwordPromptInput.isEmpty {
-                    let success = viewModel.joinRoom(room, password: passwordPromptInput)
-                    if success {
-                        passwordPromptInput = ""
-                    } else {
-                        // Wrong password - show error
-                        passwordPromptInput = ""
-                        showPasswordError = true
-                    }
+        }
+        #if os(iOS)
+        .fullScreenCover(isPresented: Binding(
+            get: { showImagePicker && !showSidebar && selectedPrivatePeerID == nil },
+            set: { newValue in
+                if !newValue {
+                    showImagePicker = false
                 }
             }
+        )) {
+            ImagePickerView(sourceType: imagePickerSourceType) { image in
+                showImagePicker = false
+                conversationUIModel.processSelectedImage(image)
+            }
+            .ignoresSafeArea()
+        }
+        #endif
+        #if os(macOS)
+        .sheet(isPresented: Binding(
+            get: { showMacImagePicker && !showSidebar && selectedPrivatePeerID == nil },
+            set: { newValue in
+                if !newValue {
+                    showMacImagePicker = false
+                }
+            }
+        )) {
+            MacImagePickerView { url in
+                showMacImagePicker = false
+                conversationUIModel.processSelectedImage(from: url)
+            }
+        }
+        #endif
+        .sheet(isPresented: Binding(
+            get: { imagePreviewURL != nil },
+            set: { presenting in
+                if !presenting {
+                    imagePreviewURL = nil
+                }
+            }
+        )) {
+            if let url = imagePreviewURL {
+                ImagePreviewView(url: url)
+            }
+        }
+        .alert("Recording Error", isPresented: rootVoiceAlertBinding, actions: {
+            Button("common.ok", role: .cancel) {}
+            if voiceRecordingVM.state == .permissionDenied {
+                Button("location_channels.action.open_settings") {
+                    SystemSettings.microphone.open()
+                }
+            }
+        }, message: {
+            Text(voiceRecordingVM.state.alertMessage)
+        })
+        .alert("content.alert.bluetooth_required.title", isPresented: rootBluetoothAlertBinding) {
+            Button("content.alert.bluetooth_required.settings") {
+                SystemSettings.bluetooth.open()
+            }
+            Button("common.ok", role: .cancel) {}
         } message: {
-            Text("Room \(viewModel.passwordPromptRoom ?? "") is password protected. Enter the password to join.")
+            Text(appChromeModel.bluetoothAlertMessage)
         }
-        .alert("Wrong Password", isPresented: $showPasswordError) {
-            Button("OK", role: .cancel) { }
-        } message: {
-            Text("The password you entered is incorrect. Please try again.")
+        .alert(
+            String(localized: "share_import.review.title", comment: "Title for reviewing content received from the share extension"),
+            isPresented: Binding(
+                get: { sharedContentImportModel.offer != nil },
+                set: { _ in }
+            ),
+            presenting: sharedContentImportModel.offer
+        ) { _ in
+            Button("common.cancel", role: .cancel) {
+                sharedContentImportModel.cancel(destination: sharedContentDestination)
+            }
+            Button("share_import.review.use_in_composer") {
+                guard let importedText = sharedContentImportModel.confirm(
+                    destination: sharedContentDestination
+                ) else { return }
+                // Replacing is deliberate and called out in the prompt. It
+                // avoids combining a stale draft from another conversation
+                // with newly shared content.
+                messageText = importedText
+                isTextFieldFocused = true
+            }
+        } message: { offer in
+            let format = String(
+                localized: "share_import.review.message",
+                comment: "Explains that shared content will replace the named destination's composer and will not be sent automatically"
+            )
+            Text(String(format: format, offer.destination.displayName) + "\n\n" + offer.payload.preview)
         }
-    }
-    
-    private var headerView: some View {
-        HStack {
-            if let privatePeerID = viewModel.selectedPrivateChatPeer,
-               let privatePeerNick = viewModel.meshService.getPeerNicknames()[privatePeerID] {
-                // Private chat header
-                Button(action: {
-                    viewModel.endPrivateChat()
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 12))
-                        Text("back")
-                            .font(.system(size: 14, design: .monospaced))
-                    }
-                    .foregroundColor(textColor)
-                }
-                .buttonStyle(.plain)
-                
-                Spacer()
-                
-                HStack(spacing: 6) {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 14))
-                        .foregroundColor(Color.orange)
-                    Text("private: \(privatePeerNick)")
-                        .font(.system(size: 16, weight: .medium, design: .monospaced))
-                        .foregroundColor(Color.orange)
-                }
-                .frame(maxWidth: .infinity)
-                
-                Spacer()
-                
-                // Favorite button
-                Button(action: {
-                    viewModel.toggleFavorite(peerID: privatePeerID)
-                }) {
-                    Image(systemName: viewModel.isFavorite(peerID: privatePeerID) ? "star.fill" : "star")
-                        .font(.system(size: 16))
-                        .foregroundColor(viewModel.isFavorite(peerID: privatePeerID) ? Color.yellow : textColor)
-                }
-                .buttonStyle(.plain)
-            } else if let currentRoom = viewModel.currentRoom {
-                // Room header
-                Button(action: {
-                    viewModel.switchToRoom(nil)
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 12))
-                        Text("back")
-                            .font(.system(size: 14, design: .monospaced))
-                    }
-                    .foregroundColor(textColor)
-                }
-                .buttonStyle(.plain)
-                
-                Spacer()
-                
-                Button(action: {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        showSidebar.toggle()
-                        sidebarDragOffset = 0
-                    }
-                }) {
-                    HStack(spacing: 6) {
-                        if viewModel.passwordProtectedRooms.contains(currentRoom) {
-                            Image(systemName: "lock.fill")
-                                .font(.system(size: 14))
-                                .foregroundColor(Color.orange)
-                        }
-                        Text("room: \(currentRoom)")
-                            .font(.system(size: 16, weight: .medium, design: .monospaced))
-                            .foregroundColor(viewModel.passwordProtectedRooms.contains(currentRoom) ? Color.orange : Color.blue)
-                    }
-                }
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity)
-                
-                Spacer()
-                
-                HStack(spacing: 8) {
-                    // Show retention indicator for all users
-                    if viewModel.retentionEnabledRooms.contains(currentRoom) {
-                        Image(systemName: "bookmark.fill")
-                            .font(.system(size: 16))
-                            .foregroundColor(Color.yellow)
-                            .help("Messages in this room are being saved locally")
-                    }
-                    
-                    // Save button - only for room owner
-                    if viewModel.roomCreators[currentRoom] == viewModel.meshService.myPeerID {
-                        Button(action: {
-                            viewModel.sendMessage("/save")
-                        }) {
-                            Image(systemName: viewModel.retentionEnabledRooms.contains(currentRoom) ? "bookmark.slash" : "bookmark")
-                                .font(.system(size: 16))
-                                .foregroundColor(textColor)
-                        }
-                        .buttonStyle(.plain)
-                        .help(viewModel.retentionEnabledRooms.contains(currentRoom) ? "Disable message retention" : "Enable message retention")
-                    }
-                    
-                    // Password button for room creator only
-                    if viewModel.roomCreators[currentRoom] == viewModel.meshService.myPeerID {
-                        Button(action: {
-                            // Toggle password protection
-                            if viewModel.passwordProtectedRooms.contains(currentRoom) {
-                                viewModel.removeRoomPassword(for: currentRoom)
-                            } else {
-                                // Show password input
-                                showPasswordInput = true
-                                passwordInputRoom = currentRoom
-                            }
-                        }) {
-                            Image(systemName: viewModel.passwordProtectedRooms.contains(currentRoom) ? "lock.fill" : "lock")
-                                .font(.system(size: 16))
-                                .foregroundColor(viewModel.passwordProtectedRooms.contains(currentRoom) ? Color.yellow : textColor)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    
-                    // Leave room button
-                    Button(action: {
-                        viewModel.leaveRoom(currentRoom)
-                    }) {
-                        Text("leave")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(Color.red)
-                    }
-                    .buttonStyle(.plain)
-                }
-            } else {
-                // Public chat header
-                HStack(spacing: 4) {
-                    Text("bitchat*")
-                        .font(.system(size: 18, weight: .medium, design: .monospaced))
-                        .foregroundColor(textColor)
-                        .onTapGesture(count: 3) {
-                            // PANIC: Triple-tap to clear all data
-                            viewModel.panicClearAllData()
-                        }
-                        .onTapGesture(count: 1) {
-                            // Single tap for app info
-                            showAppInfo = true
-                        }
-                    
-                    HStack(spacing: 0) {
-                        Text("@")
-                            .font(.system(size: 14, design: .monospaced))
-                            .foregroundColor(secondaryTextColor)
-                        
-                        TextField("nickname", text: $viewModel.nickname)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 14, design: .monospaced))
-                            .frame(maxWidth: 100)
-                            .foregroundColor(textColor)
-                            .onChange(of: viewModel.nickname) { _ in
-                                viewModel.saveNickname()
-                            }
-                            .onSubmit {
-                                viewModel.saveNickname()
-                            }
-                    }
-                }
-                
-                Spacer()
-                
-                // People counter with unread indicator
-                HStack(spacing: 4) {
-                    // Check for any unread room messages
-                    let hasUnreadRoomMessages = viewModel.unreadRoomMessages.values.contains { $0 > 0 }
-                    
-                    if hasUnreadRoomMessages {
-                        Image(systemName: "number")
-                            .font(.system(size: 12))
-                            .foregroundColor(Color.blue)
-                    }
-                    
-                    if !viewModel.unreadPrivateMessages.isEmpty {
-                        Image(systemName: "envelope.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(Color.orange)
-                    }
-                    
-                    let otherPeersCount = viewModel.connectedPeers.filter { $0 != viewModel.meshService.myPeerID }.count
-                    let roomCount = viewModel.joinedRooms.count
-                    let statusText = if !viewModel.isConnected {
-                        "alone :/"
-                    } else if roomCount > 0 {
-                        "\(otherPeersCount) \(otherPeersCount == 1 ? "person" : "people")/\(roomCount) \(roomCount == 1 ? "room" : "rooms")"
-                    } else {
-                        "\(otherPeersCount) \(otherPeersCount == 1 ? "person" : "people")"
-                    }
-                    Text(statusText)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(viewModel.isConnected ? textColor : Color.red)
-                }
-                .onTapGesture {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                        showSidebar.toggle()
-                        sidebarDragOffset = 0
-                    }
-                }
-            }
-        }
-        .frame(height: 44) // Fixed height to prevent bouncing
-        .padding(.horizontal, 12)
-        .background(backgroundColor.opacity(0.95))
-    }
-    
-    private var messagesView: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    let messages: [BitchatMessage] = {
-                        if let privatePeer = viewModel.selectedPrivateChatPeer {
-                            let msgs = viewModel.getPrivateChatMessages(for: privatePeer)
-                            // Log what we're showing
-                            // Removed debug logging
-                            return msgs
-                        } else if let currentRoom = viewModel.currentRoom {
-                            return viewModel.getRoomMessages(currentRoom)
-                        } else {
-                            return viewModel.messages
-                        }
-                    }()
-                    
-                    ForEach(messages, id: \.id) { message in
-                        VStack(alignment: .leading, spacing: 4) {
-                            // Check if current user is mentioned
-                            let isMentioned = message.mentions?.contains(viewModel.nickname) ?? false
-                            
-                            if message.sender == "system" {
-                                // System messages
-                                Text(viewModel.formatMessage(message, colorScheme: colorScheme))
-                                    .font(.system(size: 14, design: .monospaced))
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .textSelection(.enabled)
-                            } else {
-                                // Regular messages with tappable sender name
-                                HStack(alignment: .center, spacing: 0) {
-                                    // Timestamp
-                                    Text("[\(viewModel.formatTimestamp(message.timestamp))] ")
-                                        .font(.system(size: 14, design: .monospaced))
-                                        .foregroundColor(secondaryTextColor)
-                                        .textSelection(.enabled)
-                                    
-                                    // Tappable sender name
-                                    if message.sender != viewModel.nickname {
-                                        Button(action: {
-                                            if let peerID = message.senderPeerID ?? viewModel.getPeerIDForNickname(message.sender) {
-                                                viewModel.startPrivateChat(with: peerID)
-                                            }
-                                        }) {
-                                            let senderColor = viewModel.getSenderColor(for: message, colorScheme: colorScheme)
-                                            Text("<@\(message.sender)>")
-                                                .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                                .foregroundColor(senderColor)
-                                        }
-                                        .buttonStyle(.plain)
-                                    } else {
-                                        // Own messages not tappable
-                                        Text("<@\(message.sender)>")
-                                            .font(.system(size: 14, weight: .medium, design: .monospaced))
-                                            .foregroundColor(textColor)
-                                            .textSelection(.enabled)
-                                    }
-                                    
-                                    Text(" ")
-                                    
-                                    // Message content with clickable hashtags
-                                    MessageContentView(
-                                        message: message,
-                                        viewModel: viewModel,
-                                        colorScheme: colorScheme,
-                                        isMentioned: isMentioned
-                                    )
-                                    
-                                    // Delivery status indicator for private messages
-                                    if message.isPrivate && message.sender == viewModel.nickname,
-                                       let status = message.deliveryStatus {
-                                        DeliveryStatusView(status: status, colorScheme: colorScheme)
-                                            .padding(.leading, 4)
-                                            .alignmentGuide(.firstTextBaseline) { _ in 12 }
-                                    }
-                                    
-                                    Spacer()
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 2)
-                        .id(message.id)
-                    }
-                }
-                .padding(.vertical, 8)
-            }
-            .background(backgroundColor)
-            .onChange(of: viewModel.messages.count) { _ in
-                if viewModel.selectedPrivateChatPeer == nil && !viewModel.messages.isEmpty {
-                    withAnimation {
-                        proxy.scrollTo(viewModel.messages.last?.id, anchor: .bottom)
-                    }
-                }
-            }
-            .onChange(of: viewModel.privateChats) { _ in
-                if let peerID = viewModel.selectedPrivateChatPeer,
-                   let messages = viewModel.privateChats[peerID],
-                   !messages.isEmpty {
-                    withAnimation {
-                        proxy.scrollTo(messages.last?.id, anchor: .bottom)
-                    }
-                }
-            }
-            .onChange(of: viewModel.selectedPrivateChatPeer) { newPeerID in
-                // When switching to a private chat, send read receipts
-                if let peerID = newPeerID {
-                    // Small delay to ensure messages are loaded
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        viewModel.markPrivateMessagesAsRead(from: peerID)
-                    }
-                }
-            }
-            .onAppear {
-                // Also check when view appears
-                if let peerID = viewModel.selectedPrivateChatPeer {
-                    // Try multiple times to ensure read receipts are sent
-                    viewModel.markPrivateMessagesAsRead(from: peerID)
-                    
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        viewModel.markPrivateMessagesAsRead(from: peerID)
-                    }
-                    
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        viewModel.markPrivateMessagesAsRead(from: peerID)
-                    }
-                }
-            }
+        .onDisappear {
+            autocompleteDebounceTimer?.invalidate()
+            appChromeModel.setPanicPreparation(nil)
         }
     }
-    
-    private var inputView: some View {
-        VStack(spacing: 0) {
-            // Command suggestions
-            if showCommandSuggestions && !commandSuggestions.isEmpty {
-                VStack(alignment: .leading, spacing: 0) {
-                    let baseCommands: [String: String] = [
-                        "/j": "join or create a room",
-                        "/rooms": "show all discovered rooms",
-                        "/w": "see who's online",
-                        "/m": "send private message",
-                        "/clear": "clear chat messages"
-                    ]
-                    
-                    let roomCommands: [String: String] = [
-                        "/transfer": "transfer room ownership",
-                        "/pass": "change room password",
-                        "/save": "save room messages locally"
-                    ]
-                    
-                    let commandDescriptions = viewModel.currentRoom != nil 
-                        ? baseCommands.merging(roomCommands) { (_, new) in new }
-                        : baseCommands
-                    
-                    ForEach(commandSuggestions, id: \.self) { command in
-                        Button(action: {
-                            // Replace current text with selected command
-                            messageText = command + " "
-                            showCommandSuggestions = false
-                            commandSuggestions = []
-                        }) {
-                            HStack {
-                                Text(command)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(textColor)
-                                    .fontWeight(.medium)
-                                Spacer()
-                                if let description = commandDescriptions[command] {
-                                    Text(description)
-                                        .font(.system(size: 10, design: .monospaced))
-                                        .foregroundColor(secondaryTextColor)
-                                }
-                            }
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 3)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .buttonStyle(.plain)
-                        .background(Color.gray.opacity(0.1))
+
+    /// Matrix: classic opaque bars with dividers. Glass: full-bleed message
+    /// list scrolling underneath floating chrome panels (safe-area insets),
+    /// so the translucency gains usable space instead of losing it.
+    @ViewBuilder
+    private var mainContent: some View {
+        if usesGlassLayout {
+            publicMessageList
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    headerView
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    if selectedPrivatePeerID == nil {
+                        composerView
                     }
                 }
-                .background(backgroundColor)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 4)
-                        .stroke(secondaryTextColor.opacity(0.3), lineWidth: 1)
-                )
-                .padding(.horizontal, 12)
-                .padding(.bottom, 4)
-            }
-            
-            HStack(alignment: .center, spacing: 4) {
-            if viewModel.selectedPrivateChatPeer != nil {
-                Text("<@\(viewModel.nickname)> →")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color.orange)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.leading, 12)
-            } else if let currentRoom = viewModel.currentRoom, viewModel.passwordProtectedRooms.contains(currentRoom) {
-                Text("<@\(viewModel.nickname)> →")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(Color.orange)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.leading, 12)
-            } else {
-                Text("<@\(viewModel.nickname)>")
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
-                    .foregroundColor(textColor)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.leading, 12)
-            }
-            
-            TextField("", text: $messageText)
-                .textFieldStyle(.plain)
-                .font(.system(size: 14, design: .monospaced))
-                .foregroundColor(textColor)
-                .focused($isTextFieldFocused)
-                .onChange(of: messageText) { newValue in
-                    // Get cursor position (approximate - end of text for now)
-                    let cursorPosition = newValue.count
-                    viewModel.updateAutocomplete(for: newValue, cursorPosition: cursorPosition)
-                    
-                    // Check for command autocomplete
-                    if newValue.hasPrefix("/") && newValue.count >= 1 {
-                        // Build context-aware command list
-                        var commandDescriptions = [
-                            ("/j", "join or create a room"),
-                            ("/rooms", "show all discovered rooms"),
-                            ("/w", "see who's online"),
-                            ("/m", "send private message"),
-                            ("/clear", "clear chat messages")
-                        ]
-                        
-                        // Add room-specific commands if in a room
-                        if viewModel.currentRoom != nil {
-                            commandDescriptions.append(("/transfer", "transfer room ownership"))
-                            commandDescriptions.append(("/pass", "change room password"))
-                            commandDescriptions.append(("/save", "save room messages locally"))
-                        }
-                        
-                        let input = newValue.lowercased()
-                        commandSuggestions = commandDescriptions
-                            .filter { $0.0.starts(with: input) }
-                            .map { $0.0 }
-                        showCommandSuggestions = !commandSuggestions.isEmpty
-                    } else {
-                        showCommandSuggestions = false
-                        commandSuggestions = []
-                    }
-                }
-                .onSubmit {
-                    sendMessage()
-                }
-            
-            Button(action: sendMessage) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 20))
-                    .foregroundColor((viewModel.selectedPrivateChatPeer != nil || 
-                                     (viewModel.currentRoom != nil && viewModel.passwordProtectedRooms.contains(viewModel.currentRoom ?? ""))) 
-                                     ? Color.orange : textColor)
-            }
-            .buttonStyle(.plain)
-            .padding(.trailing, 12)
-            }
-            .padding(.vertical, 8)
-            .background(backgroundColor.opacity(0.95))
-        }
-        .onAppear {
-            isTextFieldFocused = true
-        }
-    }
-    
-    private func sendMessage() {
-        viewModel.sendMessage(messageText)
-        messageText = ""
-    }
-    
-    private var sidebarView: some View {
-        HStack(spacing: 0) {
-            // Grey vertical bar for visual continuity
-            Rectangle()
-                .fill(Color.gray.opacity(0.3))
-                .frame(width: 1)
-            
-            VStack(alignment: .leading, spacing: 0) {
-                // Header - match main toolbar height
-                HStack {
-                    Text("connected")
-                        .font(.system(size: 16, weight: .bold, design: .monospaced))
-                        .foregroundColor(textColor)
-                    Spacer()
-                }
-                .frame(height: 44) // Match header height
-                .padding(.horizontal, 12)
-                .background(backgroundColor.opacity(0.95))
-                
+        } else {
+            VStack(spacing: 0) {
+                headerView
+
                 Divider()
-            
-            // Rooms and People list
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    // Joined Rooms section
-                    if !viewModel.joinedRooms.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("ROOMS")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal, 12)
-                            
-                            ForEach(Array(viewModel.joinedRooms).sorted(), id: \.self) { room in
-                                Button(action: {
-                                    // Check if room needs password and we don't have it
-                                    if viewModel.passwordProtectedRooms.contains(room) && viewModel.roomKeys[room] == nil {
-                                        // Need password
-                                        viewModel.passwordPromptRoom = room
-                                        viewModel.showPasswordPrompt = true
-                                    } else {
-                                        // Can enter room
-                                        viewModel.switchToRoom(room)
-                                        withAnimation(.spring()) {
-                                            showSidebar = false
-                                        }
-                                    }
-                                }) {
-                                    HStack {
-                                        // Lock icon for password protected rooms
-                                        if viewModel.passwordProtectedRooms.contains(room) {
-                                            Image(systemName: "lock.fill")
-                                                .font(.system(size: 10))
-                                                .foregroundColor(secondaryTextColor)
-                                        }
-                                        
-                                        Text(room)
-                                            .font(.system(size: 14, design: .monospaced))
-                                            .foregroundColor(viewModel.currentRoom == room ? Color.blue : textColor)
-                                        
-                                        Spacer()
-                                        
-                                        // Unread count
-                                        if let unreadCount = viewModel.unreadRoomMessages[room], unreadCount > 0 {
-                                            Text("\(unreadCount)")
-                                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                                .foregroundColor(backgroundColor)
-                                                .padding(.horizontal, 6)
-                                                .padding(.vertical, 2)
-                                                .background(Color.orange)
-                                                .clipShape(Capsule())
-                                        }
-                                        
-                                        // Room controls
-                                        if viewModel.currentRoom == room {
-                                            HStack(spacing: 4) {
-                                                // Password button for room creator only
-                                                if viewModel.roomCreators[room] == viewModel.meshService.myPeerID {
-                                                    Button(action: {
-                                                        // Toggle password protection
-                                                        if viewModel.passwordProtectedRooms.contains(room) {
-                                                            viewModel.removeRoomPassword(for: room)
-                                                        } else {
-                                                            // Show password input
-                                                            showPasswordInput = true
-                                                            passwordInputRoom = room
-                                                        }
-                                                    }) {
-                                                        HStack(spacing: 2) {
-                                                            Image(systemName: viewModel.passwordProtectedRooms.contains(room) ? "lock.fill" : "lock")
-                                                                .font(.system(size: 10))
-                                                        }
-                                                        .foregroundColor(viewModel.passwordProtectedRooms.contains(room) ? backgroundColor : secondaryTextColor)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 2)
-                                                        .background(viewModel.passwordProtectedRooms.contains(room) ? Color.orange : Color.clear)
-                                                        .overlay(
-                                                            RoundedRectangle(cornerRadius: 4)
-                                                                .stroke(viewModel.passwordProtectedRooms.contains(room) ? Color.orange : secondaryTextColor.opacity(0.5), lineWidth: 1)
-                                                        )
-                                                    }
-                                                    .buttonStyle(.plain)
-                                                }
-                                                
-                                                // Leave button
-                                                Button(action: {
-                                                    viewModel.leaveRoom(room)
-                                                }) {
-                                                    Text("leave room")
-                                                        .font(.system(size: 10, design: .monospaced))
-                                                        .foregroundColor(secondaryTextColor)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 2)
-                                                        .overlay(
-                                                            RoundedRectangle(cornerRadius: 4)
-                                                                .stroke(secondaryTextColor.opacity(0.5), lineWidth: 1)
-                                                        )
-                                                }
-                                                .buttonStyle(.plain)
-                                            }
-                                        }
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 4)
-                                    .background(viewModel.currentRoom == room ? backgroundColor.opacity(0.5) : Color.clear)
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        
-                        Divider()
-                            .padding(.vertical, 4)
-                    }
-                    
-                    // People section
-                    VStack(alignment: .leading, spacing: 8) {
-                        // Show appropriate header based on context
-                        if let currentRoom = viewModel.currentRoom {
-                            Text("IN \(currentRoom.uppercased())")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal, 12)
-                        } else if !viewModel.connectedPeers.isEmpty {
-                            Text("PEOPLE")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal, 12)
-                        }
-                        
-                        if viewModel.connectedPeers.isEmpty {
-                            Text("No one connected")
-                                .font(.system(size: 14, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal)
-                        } else if let currentRoom = viewModel.currentRoom,
-                                  let roomMemberIDs = viewModel.roomMembers[currentRoom],
-                                  roomMemberIDs.isEmpty {
-                            Text("No one in this room yet")
-                                .font(.system(size: 14, design: .monospaced))
-                                .foregroundColor(secondaryTextColor)
-                                .padding(.horizontal)
-                        } else {
-                            let peerNicknames = viewModel.meshService.getPeerNicknames()
-                            let peerRSSI = viewModel.meshService.getPeerRSSI()
-                            let myPeerID = viewModel.meshService.myPeerID
-                            
-                            // Filter peers based on current room
-                            let peersToShow: [String] = {
-                                if let currentRoom = viewModel.currentRoom,
-                                   let roomMemberIDs = viewModel.roomMembers[currentRoom] {
-                                    // Show only peers who have sent messages to this room (including self)
-                                    
-                                    // Start with room members who are also connected
-                                    var memberPeers = viewModel.connectedPeers.filter { roomMemberIDs.contains($0) }
-                                    
-                                    // Always include ourselves if we're a room member
-                                    if roomMemberIDs.contains(myPeerID) && !memberPeers.contains(myPeerID) {
-                                        memberPeers.append(myPeerID)
-                                    }
-                                    
-                                    return memberPeers
-                                } else {
-                                    // Show all connected peers in main chat
-                                    return viewModel.connectedPeers
-                                }
-                            }()
-                            
-                        // Sort peers: favorites first, then alphabetically by nickname
-                        let sortedPeers = peersToShow.sorted { peer1, peer2 in
-                            let isFav1 = viewModel.isFavorite(peerID: peer1)
-                            let isFav2 = viewModel.isFavorite(peerID: peer2)
-                            
-                            if isFav1 != isFav2 {
-                                return isFav1 // Favorites come first
-                            }
-                            
-                            let name1 = peerNicknames[peer1] ?? "person-\(peer1.prefix(4))"
-                            let name2 = peerNicknames[peer2] ?? "person-\(peer2.prefix(4))"
-                            return name1 < name2
-                        }
-                        
-                        ForEach(sortedPeers, id: \.self) { peerID in
-                            let displayName = peerID == myPeerID ? viewModel.nickname : (peerNicknames[peerID] ?? "person-\(peerID.prefix(4))")
-                            let rssi = peerRSSI[peerID]?.intValue ?? -100
-                            let isFavorite = viewModel.isFavorite(peerID: peerID)
-                            let isMe = peerID == myPeerID
-                            
-                            HStack(spacing: 8) {
-                                // Signal strength indicator or unread message icon
-                                if isMe {
-                                    Image(systemName: "person.fill")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(textColor)
-                                } else if viewModel.unreadPrivateMessages.contains(peerID) {
-                                    Image(systemName: "envelope.fill")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(Color.orange)
-                                } else {
-                                    Circle()
-                                        .fill(viewModel.getRSSIColor(rssi: rssi, colorScheme: colorScheme))
-                                        .frame(width: 8, height: 8)
-                                }
-                                
-                                // Favorite star (not for self)
-                                if !isMe {
-                                    Button(action: {
-                                        viewModel.toggleFavorite(peerID: peerID)
-                                    }) {
-                                        Image(systemName: isFavorite ? "star.fill" : "star")
-                                            .font(.system(size: 12))
-                                            .foregroundColor(isFavorite ? Color.yellow : secondaryTextColor)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                                
-                                // Peer name
-                                if isMe {
-                                    HStack {
-                                        Text(displayName + " (you)")
-                                            .font(.system(size: 14, design: .monospaced))
-                                            .foregroundColor(textColor)
-                                        
-                                        Spacer()
-                                    }
-                                } else {
-                                    Button(action: {
-                                        if peerNicknames[peerID] != nil {
-                                            viewModel.startPrivateChat(with: peerID)
-                                            withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                                                showSidebar = false
-                                                sidebarDragOffset = 0
-                                            }
-                                        }
-                                    }) {
-                                        HStack {
-                                            Text(displayName)
-                                                .font(.system(size: 14, design: .monospaced))
-                                                .foregroundColor(peerNicknames[peerID] != nil ? textColor : secondaryTextColor)
-                                            
-                                            Spacer()
-                                        }
-                                    }
-                                    .buttonStyle(.plain)
-                                    .disabled(peerNicknames[peerID] == nil)
-                                }
-                            }
-                            .padding(.horizontal)
-                            .padding(.vertical, 8)
-                        }
-                        }
-                    }
-                }
-                .padding(.vertical, 8)
-            }
-            
-            Spacer()
-        }
-        .background(backgroundColor)
-        }
-    }
-}
 
-// Helper view for rendering message content with clickable hashtags
-struct MessageContentView: View {
-    let message: BitchatMessage
-    let viewModel: ChatViewModel
-    let colorScheme: ColorScheme
-    let isMentioned: Bool
-    
-    var body: some View {
-        let content = message.content
-        let hashtagPattern = "#([a-zA-Z0-9_]+)"
-        let mentionPattern = "@([a-zA-Z0-9_]+)"
-        
-        let hashtagRegex = try? NSRegularExpression(pattern: hashtagPattern, options: [])
-        let mentionRegex = try? NSRegularExpression(pattern: mentionPattern, options: [])
-        
-        let hashtagMatches = hashtagRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        let mentionMatches = mentionRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        
-        // Combine all matches and sort by location
-        var allMatches: [(range: NSRange, type: String)] = []
-        for match in hashtagMatches {
-            allMatches.append((match.range(at: 0), "hashtag"))
-        }
-        for match in mentionMatches {
-            allMatches.append((match.range(at: 0), "mention"))
-        }
-        allMatches.sort { $0.range.location < $1.range.location }
-        
-        // Build the text view with clickable hashtags
-        return HStack(spacing: 0) {
-            ForEach(Array(buildTextSegments().enumerated()), id: \.offset) { _, segment in
-                if segment.type == "hashtag" {
-                    Button(action: {
-                        _ = viewModel.joinRoom(segment.text)
-                    }) {
-                        Text(segment.text)
-                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                            .foregroundColor(Color.blue)
-                            .underline()
-                            .textSelection(.enabled)
+                GeometryReader { geometry in
+                    VStack(spacing: 0) {
+                        publicMessageList
+                            .background(palette.background)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
-                    .buttonStyle(.plain)
-                } else if segment.type == "mention" {
-                    Text(segment.text)
-                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
-                        .foregroundColor(Color.orange)
-                        .textSelection(.enabled)
-                } else {
-                    Text(segment.text)
-                        .font(.system(size: 14, design: .monospaced))
-                        .fontWeight(isMentioned ? .bold : .regular)
-                        .textSelection(.enabled)
+                    .frame(width: geometry.size.width, height: geometry.size.height)
                 }
-            }
-        }
-    }
-    
-    private func buildTextSegments() -> [(text: String, type: String)] {
-        var segments: [(text: String, type: String)] = []
-        let content = message.content
-        var lastEnd = content.startIndex
-        
-        let hashtagPattern = "#([a-zA-Z0-9_]+)"
-        let mentionPattern = "@([a-zA-Z0-9_]+)"
-        
-        let hashtagRegex = try? NSRegularExpression(pattern: hashtagPattern, options: [])
-        let mentionRegex = try? NSRegularExpression(pattern: mentionPattern, options: [])
-        
-        let hashtagMatches = hashtagRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        let mentionMatches = mentionRegex?.matches(in: content, options: [], range: NSRange(location: 0, length: content.count)) ?? []
-        
-        // Combine all matches and sort by location
-        var allMatches: [(range: NSRange, type: String)] = []
-        for match in hashtagMatches {
-            allMatches.append((match.range(at: 0), "hashtag"))
-        }
-        for match in mentionMatches {
-            allMatches.append((match.range(at: 0), "mention"))
-        }
-        allMatches.sort { $0.range.location < $1.range.location }
-        
-        for (matchRange, matchType) in allMatches {
-            if let range = Range(matchRange, in: content) {
-                // Add text before the match
-                if lastEnd < range.lowerBound {
-                    let beforeText = String(content[lastEnd..<range.lowerBound])
-                    if !beforeText.isEmpty {
-                        segments.append((beforeText, "text"))
-                    }
-                }
-                
-                // Add the match
-                let matchText = String(content[range])
-                segments.append((matchText, matchType))
-                
-                lastEnd = range.upperBound
-            }
-        }
-        
-        // Add any remaining text
-        if lastEnd < content.endIndex {
-            let remainingText = String(content[lastEnd...])
-            if !remainingText.isEmpty {
-                segments.append((remainingText, "text"))
-            }
-        }
-        
-        return segments
-    }
-}
 
-// Delivery status indicator view
-struct DeliveryStatusView: View {
-    let status: DeliveryStatus
-    let colorScheme: ColorScheme
-    
-    private var textColor: Color {
-        colorScheme == .dark ? Color.green : Color(red: 0, green: 0.5, blue: 0)
+                Divider()
+
+                if selectedPrivatePeerID == nil {
+                    composerView
+                }
+            }
+        }
     }
-    
-    private var secondaryTextColor: Color {
-        colorScheme == .dark ? Color.green.opacity(0.8) : Color(red: 0, green: 0.5, blue: 0).opacity(0.8)
+
+    private var headerView: some View {
+        ContentHeaderView(
+            showSidebar: $showSidebar,
+            showVerifySheet: $showVerifySheet,
+            isNicknameFieldFocused: $isNicknameFieldFocused,
+            headerHeight: headerHeight,
+            headerPeerIconSize: headerPeerIconSize,
+            headerPeerCountFontSize: headerPeerCountFontSize
+        )
     }
-    
-    var body: some View {
-        switch status {
-        case .sending:
-            Image(systemName: "circle")
-                .font(.system(size: 10))
-                .foregroundColor(secondaryTextColor.opacity(0.6))
-            
-        case .sent:
-            Image(systemName: "checkmark")
-                .font(.system(size: 10))
-                .foregroundColor(secondaryTextColor.opacity(0.6))
-            
-        case .delivered(let nickname, _):
-            HStack(spacing: -2) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
-            }
-            .foregroundColor(textColor.opacity(0.8))
-            .help("Delivered to \(nickname)")
-            
-        case .read(let nickname, _):
-            HStack(spacing: -2) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .bold))
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10, weight: .bold))
-            }
-            .foregroundColor(Color(red: 0.0, green: 0.478, blue: 1.0))  // Bright blue
-            .help("Read by \(nickname)")
-            
-        case .failed(let reason):
-            Image(systemName: "exclamationmark.triangle")
-                .font(.system(size: 10))
-                .foregroundColor(Color.red.opacity(0.8))
-                .help("Failed: \(reason)")
-            
-        case .partiallyDelivered(let reached, let total):
-            HStack(spacing: 1) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 10))
-                Text("\(reached)/\(total)")
-                    .font(.system(size: 10, design: .monospaced))
-            }
-            .foregroundColor(secondaryTextColor.opacity(0.6))
-            .help("Delivered to \(reached) of \(total) members")
+
+    private var publicMessageList: some View {
+        MessageListView(
+            privatePeer: nil,
+            isAtBottom: $isAtBottomPublic,
+            messageText: $messageText,
+            selectedMessageSender: $selectedMessageSender,
+            selectedMessageSenderID: $selectedMessageSenderID,
+            imagePreviewURL: $imagePreviewURL,
+            windowCountPublic: $windowCountPublic,
+            windowCountPrivate: $windowCountPrivate,
+            showSidebar: $showSidebar,
+            isTextFieldFocused: $isTextFieldFocused
+        )
+    }
+
+    private var composerView: some View {
+        #if os(iOS)
+        ContentComposerView(
+            messageText: $messageText,
+            isTextFieldFocused: $isTextFieldFocused,
+            voiceRecordingVM: voiceRecordingVM,
+            autocompleteDebounceTimer: $autocompleteDebounceTimer,
+            onSendMessage: sendMessage,
+            showImagePicker: $showImagePicker,
+            imagePickerSourceType: $imagePickerSourceType
+        )
+        #else
+        ContentComposerView(
+            messageText: $messageText,
+            isTextFieldFocused: $isTextFieldFocused,
+            voiceRecordingVM: voiceRecordingVM,
+            autocompleteDebounceTimer: $autocompleteDebounceTimer,
+            onSendMessage: sendMessage,
+            showMacImagePicker: $showMacImagePicker
+        )
+        #endif
+    }
+
+    private func sendMessage() {
+        guard let trimmed = messageText.trimmedOrNilIfEmpty else { return }
+
+        messageText = ""
+
+        DispatchQueue.main.async {
+            self.conversationUIModel.sendMessage(trimmed)
         }
     }
 }
